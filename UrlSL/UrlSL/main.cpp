@@ -11,11 +11,11 @@
 
 class Server {
 	SOCKET _listenSocket;
-	std::mutex _shouldHandleStopLock;
 	bool _shouldHandleStop;
 	addrinfo* _sockAddr;
 	HANDLE _hThread;
 	std::string _reply;
+	std::list<ServerThread> _serverThreads;
 
 	static SSL_CTX* newTlsContext() {
 		SSL_library_init();
@@ -50,7 +50,7 @@ class Server {
 
 		struct addrinfo hints;
 		ZeroMemory(&hints, sizeof(hints));
-		hints.ai_family = AF_INET6;
+		hints.ai_family = AF_INET;
 		hints.ai_socktype = SOCK_STREAM;
 		hints.ai_protocol = IPPROTO_TCP;
 		hints.ai_flags = AI_PASSIVE;
@@ -106,9 +106,7 @@ class Server {
 
 	public:
 		bool StopHandling(bool forciblyStop = false) {
-			_shouldHandleStopLock.lock();
 			_shouldHandleStop = true;
-			_shouldHandleStopLock.unlock();
 			if (WaitForSingleObject(_hThread, forciblyStop ? TIMEOUT_UNTIL_THREAD_TERMINATE : INFINITE) != WAIT_OBJECT_0) {
 				if (forciblyStop) return TerminateThread(_hThread, NULL);
 				else return false;
