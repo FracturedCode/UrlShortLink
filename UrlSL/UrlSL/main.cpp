@@ -6,7 +6,8 @@
 #include <future>
 #include <thread>
 #include <mutex>
-#define SERVER_PORT "8001"
+#define TLS_SERVER_PORT 8001
+#define HTTP_SERVER_PORT 8003
 #define TIMEOUT_UNTIL_THREAD_TERMINATE 20
 
 class Server {

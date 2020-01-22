@@ -14,7 +14,7 @@ private:
     bool _continueThread;
 
     static void handleTls(void* s);
-    static void handleHttp(void* s);
+    //static void handleHttp(void* s); TODO
 public:
     ServerThread(SOCKET listenSocket, ServerThreadType type, std::mutex* acceptMutex, SSL_CTX* tlsCtx);
 
@@ -25,7 +25,14 @@ public:
 
 class Server {
 private:
+    SOCKET _tlsListenSocket;
     std::list<ServerThread> _serverThreads;
+    std::mutex _tlsAcceptMutex;
+
+    SOCKET createListenSocket(int port);
+    SSL_CTX* createTlsCtx();
 public:
     Server(unsigned int TlsThreadCount, unsigned int HttpThreadCount);
+
+    bool StopAllThreads(bool forciblyStop=false);
 }
