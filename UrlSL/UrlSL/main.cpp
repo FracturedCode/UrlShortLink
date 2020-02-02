@@ -6,11 +6,13 @@
 #include <future>
 #include <thread>
 #include <mutex>
+#include <list>
+#include "windows.h"
 #define TLS_SERVER_PORT 8001
 #define HTTP_SERVER_PORT 8003
 #define TIMEOUT_UNTIL_THREAD_TERMINATE 20
 
-class Server {
+/*class Server {
 	SOCKET _listenSocket;
 	bool _shouldHandleStop;
 	addrinfo* _sockAddr;
@@ -121,13 +123,18 @@ class Server {
 			_reply = "HTTP/1.1 301 Moved Permanently\r\nCache-Control: max-age=1\r\nLocation: https://google.com/ \r\n\r\n";
 			StartHandling();
 		}
-};
+};*/
 
 int main(int argc, char** argv) {
-	
-	Server s;
+	WSADATA wsaData;
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+		std::cout << "WSAStartup failed\n" << WSAGetLastError();
+		exit(EXIT_FAILURE);
+	}
+
+	Server s(1, false);
 	getchar();
-	s.StopHandling();
+	s.StopAllThreads();
 	
 	WSACleanup();
 	return 0;
