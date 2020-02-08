@@ -15,7 +15,6 @@
 #define SERVER_PORT "8001"
 #define TIMEOUT_UNTIL_THREAD_TERMINATE 20
 #define MAX_PACKET_COUNT 3
-#define CLIENT_HANDLER_CHUNK_LENGTH 200
 
 void log(std::string logString, int errorNo = NULL) {
 	std::cout << logString << " " << errorNo << std::endl;	//TODO advanced error logging mechanisms
@@ -38,14 +37,17 @@ class Client {
 	std::mutex _readWriteLock;
 	short _readCount;
 	bool _isDestroyed;
+	SOCKET _socket;
+	WSAPOLLFD _pollFd;
+	SSL* _ssl;
 
 
 	bool destroy() {
-		SSL_shutdown(Ssl);
-		SSL_free(Ssl);	//TODO vrv
-		shutdown(Socket, SD_SEND);//TODO order of shutdown/send
-		closesocket(Socket);//nonblocking close and shutdown?
-		PollFd->fd = NULL;
+		SSL_shutdown(_ssl);
+		SSL_free(_ssl);	//TODO vrv
+		shutdown(_socket, SD_SEND);//TODO order of shutdown/send
+		closesocket(_socket);//nonblocking close and shutdown?
+		_pollFd.fd = NULL;
 		_isDestroyed = true;
 		_readWriteLock.try_lock();
 		_readWriteLock.unlock();
@@ -54,34 +56,33 @@ class Client {
 
 
 public:
-	SOCKET Socket;
-	WSAPOLLFD* PollFd;
-	SSL* Ssl;
 	char Buffer[BUFFER_SIZE];
 	int MessageSize;
 
 
-	Client() : MessageSize(0), _isDestroyed(true) {}
+	Client() : MessageSize(0), _isDestroyed(true) {
+		_pollFd.events = POLLRDNORM;
+	}
 
 
-	bool IsDestroyed() { return _isDestroyed; }
-
-
-	void Reconfigure(SOCKET sock, SSL* ssl) {
-		_readWriteLock.lock();//TODO deadlock potential
-		Ssl = ssl;
-		Socket = sock;
-		PollFd->fd = sock;
-		PollFd->events = POLLRDNORM;
-		PollFd->revents = 0;
-		MessageSize = 0;
-		_readCount = 0;
-		_readWriteLock.unlock();
+	bool ReconfigureIfReady(SOCKET sock, SSL* ssl) {
+		if (_isDestroyed && _readWriteLock.try_lock()) {
+			_ssl = ssl;
+			_socket = sock;
+			_pollFd.fd = sock;
+			MessageSize = 0;
+			_readCount = 0;
+			_isDestroyed = false;
+			_readWriteLock.unlock();
+			return true;
+		}
+		else return false;
 	}
 
 	void ReadNotCompleted() {
-		if (_readCount >= MAX_PACKET_COUNT && !_isDestroyed && _readWriteLock.try_lock()) {
+		if (_readCount >= MAX_PACKET_COUNT && !_isDestroyed) {
 			destroy();
+			log("A client was destroyed as it surpassed the maximum number of reads limit.");
 		}
 		else {
 			_readWriteLock.try_lock();
@@ -89,21 +90,33 @@ public:
 		}
 	}
 
-	bool Read() {	//TODO think about orders of locks in Read -> ReadNotCompleted -> WriteAndDestroy context
+	bool ReadIfReady() {
 		if (!_isDestroyed && _readWriteLock.try_lock()) {
-			MessageSize += SSL_read(Ssl, &Buffer[MessageSize-1], BUFFER_SIZE - MessageSize);//TODO vrv
-			_readCount++;
-			PollFd->revents = 0;
-			_readWriteLock.unlock();
-			return true;
+			WSAPoll(&_pollFd, 1, 0);
+			if (_pollFd.revents & POLLRDNORM) {
+				SSL* ssl = _ssl;
+				MessageSize += SSL_read(ssl, &Buffer[MessageSize - 1], BUFFER_SIZE - MessageSize);//TODO vrv
+				_ssl = ssl;
+				_readCount++;
+				return true;
+			}
+			else {
+				_readWriteLock.unlock();
+				return false;
+			}
 		}
 		else return false;
 	}
 
-	void WriteAndDestroy(std::string* reply) {
-		if (!_isDestroyed && _readWriteLock.try_lock()) {
-			SSL_write(Ssl, reply->c_str(), reply->length());	//TODO vrv
+	bool WriteAndDestroy(std::string* reply) {
+		if (!_isDestroyed) {
+			SSL_write(_ssl, reply->c_str(), reply->length());	//TODO vrv
 			destroy();
+			return true;
+		}
+		else {
+			log("A clientHandler tried to write to an already destroyed or currently-being-handled client.");
+			return false;
 		}
 	}
 
@@ -118,37 +131,27 @@ public:
 
 class WorkManager {
 	Client _clients[MAX_CONNECTION_COUNT];
-	WSAPOLLFD _pollFds[MAX_CONNECTION_COUNT];
-	std::mutex _workLock;
-	int _getIterator;
-	int _setIterator;
-
 
 public:
-	WorkManager() : _setIterator(0), _getIterator(0) {}
-
-
 	Client* GetNextWork() {
-		std::scoped_lock(_workLock);
-		if (++_getIterator == MAX_CONNECTION_COUNT) _getIterator = 0;
-		return &_clients[_getIterator];
+		unsigned int i = 0;
+		while (!_clients[i].ReadIfReady()) {
+			if (++i == MAX_CONNECTION_COUNT) {
+				i = 0;
+				Sleep(1);
+			}
+		}
+		return &_clients[i];
 	}
 
-	void AddWork(SOCKET sock, SSL* ssl) {					// TODO knowing me _setIterator obo probably.
-		for (int i = 0; i < MAX_CONNECTION_COUNT; i++) {	// Cycle through the queue once,
-			if (_setIterator == MAX_CONNECTION_COUNT) _setIterator = 0;
-			if (_clients[_setIterator].IsDestroyed()) {		// Return early if a candidate is found
-				_clients[_setIterator].Reconfigure(sock, ssl);
-				_setIterator++;
-				return;
+	void AddWork(SOCKET sock, SSL* ssl) {
+		unsigned int i = 0;
+		while (!_clients[i].ReconfigureIfReady(sock, ssl)) {
+			if (++i == MAX_CONNECTION_COUNT) {
+				i = 0;
+				log("Could not find available slots to hold new connections. The system might not be keeping up with the amount of requests.");
+				Sleep(1);
 			}
-			_setIterator++;
-		}
-		if (_clients[_setIterator].WaitForDestruction()) {	// Otherwise just wait for a client to finish up.
-			_clients[_setIterator].Reconfigure(sock, ssl);
-		}
-		else {
-			log("Could not AddWork() successfully. The system might not be keeping up with the amount of requests.");
 		}
 	}
 };
@@ -163,11 +166,15 @@ private:
 	static void clientHandler(void* s) {
 		Server* self = static_cast<Server*>(s);
 
+		std::string reply = "HTTP/1.1 301 Moved Permanently\r\nCache-Control: max-age=1\r\nLocation: https://google.com/ \r\n\r\n";
+		bool condition = false;	//TODO probably just look for a CRLF CRLF after Read()
 		Client* client = NULL;
-		Client& c = *client;
 		while (!self->_shouldStop) {
 			client = self->_wm.GetNextWork();
-			
+			if (condition) client->ReadNotCompleted();
+			else if (!client->WriteAndDestroy(&reply)) {
+				client->WriteAndDestroy(&reply);
+			}
 		}
 	}
 
@@ -244,21 +251,23 @@ public:
 
 		int handlerThreadCount = (std::thread::hardware_concurrency() - 1) * 2;	// TODO Needs to be a bit more advanced and generous
 		if (handlerThreadCount <= 0) handlerThreadCount = 1;
+		handlerThreadCount = 6;
 		for (int i = 0; i < handlerThreadCount; i++) { _threads.push_back((HANDLE)_beginthread(Server::clientHandler, 0, (void*)this)); }
 	}
 
 	bool Stop(bool forceTerminate = false) {
 		this->_shouldStop = true;
 		bool success = true;
-		if (WaitForSingleObject(_hThreadAcceptor, forceTerminate ? TIMEOUT_UNTIL_THREAD_TERMINATE : INFINITE) != WAIT_OBJECT_0) {
-			if (forceTerminate && !TerminateThread(_hThreadAcceptor, NULL)) success = false;
-		}
-		if (WaitForMultipleObjects(_threads.size(), _threads.data(), true, forceTerminate ? TIMEOUT_UNTIL_THREAD_TERMINATE : INFINITE) != WAIT_OBJECT_0) {
+		if (WaitForMultipleObjects(_threads.size(), _threads.data(), true, forceTerminate ? TIMEOUT_UNTIL_THREAD_TERMINATE : INFINITE) != WAIT_OBJECT_0) {	//TODO forceterminate is the only thing that works rn
 			if (forceTerminate) {
 				for (std::vector<HANDLE>::iterator it = _threads.begin(); it != _threads.end(); it++) {
 					if (!TerminateThread(*it, NULL)) success = false;
 				}
 			}
+			else success = false;
+		}
+		if (WaitForSingleObject(_hThreadAcceptor, forceTerminate ? TIMEOUT_UNTIL_THREAD_TERMINATE : INFINITE) != WAIT_OBJECT_0) {
+			if (forceTerminate && !TerminateThread(_hThreadAcceptor, NULL)) success = false;
 		}
 		return success;
 	}
@@ -267,7 +276,7 @@ public:
 int main() {
 	Server* s = new Server();
 	getchar();
-	s->Stop(); // TODO vrv
+	s->Stop(true); // TODO vrv
 	delete s;
 	WSACleanup();
 	return 0;
