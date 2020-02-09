@@ -19,7 +19,7 @@
 void log(std::string logString, int errorNo = NULL) {
 	std::cout << logString << " " << errorNo << std::endl;	//TODO advanced error logging mechanisms
 }
-
+int wait = 0;
 uint64_t s[] = {clock(), clock()};
 uint64_t nextXorShift128(void) {
 	uint64_t s1 = s[0];
@@ -31,7 +31,29 @@ uint64_t nextXorShift128(void) {
 	return result;
 }
 
-
+SSL_CTX* newTlsCtx() {
+	SSL_CTX* ctx;
+	SSL_library_init();
+	SSL_load_error_strings();
+	if ((ctx = SSL_CTX_new(TLS_server_method())) == NULL) {
+		std::cout << "Fail creating SSL context. Exact error:\n";//TODO error logging
+		ERR_print_errors_fp(stderr);
+		exit(EXIT_FAILURE);
+	}
+	//SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+	if (_wchdir(L"E:\\repos\\UrlSL\\UrlSL\\x64\\Debug\\") != 0) {
+		std::cout << "_wchdir failed. Could not change the cwd\n";
+		exit(EXIT_FAILURE);
+	}
+	if (!SSL_CTX_use_certificate_file(ctx, "localhost.crt", SSL_FILETYPE_PEM) ||
+		!SSL_CTX_use_PrivateKey_file(ctx, "localhost.key", SSL_FILETYPE_PEM) ||
+		!SSL_CTX_check_private_key(ctx)) {
+		std::cout << "Failed to open certificates or load them. Exact error: \n";
+		ERR_print_errors_fp(stderr);
+		exit(EXIT_FAILURE);
+	}
+	return ctx;
+}
 
 class Client {
 	std::mutex _readWriteLock;
@@ -128,28 +150,92 @@ public:
 		return _isDestroyed;
 	}
 };
+struct AcceptClient {
+	bool handled = true;
+	SOCKET socket;
+	std::mutex lock;
+	bool queueUp(SOCKET sock) {
+		std::scoped_lock(lock);
+		if (handled) {
+			socket = sock;
+			handled = false;
+			return true;
+		}
+		else return false;
+	}
+	SOCKET handle(SSL* ssl) {
+		std::scoped_lock(lock);
+		if (handled || socket == NULL) return NULL;
+		else {
+			SSL_set_fd(ssl, socket);
+			SSL_accept(ssl);
+			handled = true;
+			return socket;
+		}
+	}
+};
 
 class WorkManager {
 	Client _clients[MAX_CONNECTION_COUNT];
+	AcceptClient _acceptClients[MAX_CONNECTION_COUNT];
+	HANDLE _thread;
+	HANDLE _thread2;
+
+	static void Acceptor(void* w) {
+		WorkManager* wm = static_cast<WorkManager*>(w);
+		SSL_CTX* ctx = newTlsCtx();
+		SSL* newSsl = SSL_new(ctx);
+		int i = 0;
+		while (1) {
+			if (++i == MAX_CONNECTION_COUNT) {
+				i = 0;
+			}
+			SOCKET socket = wm->_acceptClients[i].handle(newSsl);
+			if (socket != NULL) {
+				wm->AddWork(socket, newSsl);
+				newSsl = SSL_new(ctx);
+			}
+		}
+	}
 
 public:
+	WorkManager() {
+		_thread = (HANDLE)_beginthread(WorkManager::Acceptor, 0, (void*)this);
+		_thread2 = (HANDLE)_beginthread(WorkManager::Acceptor, 0, (void*)this);
+	}
+	~WorkManager() {
+		TerminateThread(_thread, NULL);
+		TerminateThread(_thread2, NULL);
+	}
 	Client* GetNextWork() {
 		unsigned int i = 0;
 		while (!_clients[i].ReadIfReady()) {
 			if (++i == MAX_CONNECTION_COUNT) {
 				i = 0;
+				wait++;
 				Sleep(1);
 			}
 		}
 		return &_clients[i];
 	}
-
+	
 	void AddWork(SOCKET sock, SSL* ssl) {
 		unsigned int i = 0;
 		while (!_clients[i].ReconfigureIfReady(sock, ssl)) {
 			if (++i == MAX_CONNECTION_COUNT) {
 				i = 0;
 				log("Could not find available slots to hold new connections. The system might not be keeping up with the amount of requests.");
+				Sleep(1);
+			}
+		}
+	}
+
+	void AddAccept(SOCKET sock) {
+		unsigned int i = 0;
+		while (!_acceptClients[i].queueUp(sock)) {
+			if (++i == MAX_CONNECTION_COUNT) {
+				i = 0;
+				log("Clients not being accepted fast enough");
 				Sleep(1);
 			}
 		}
@@ -181,27 +267,6 @@ private:
 	static void tlsAcceptor(void* s) {
 		Server* self = static_cast<Server*>(s);
 
-		SSL_library_init();
-		SSL_load_error_strings();
-		SSL_CTX* ctx;
-		if ((ctx = SSL_CTX_new(TLS_server_method())) == NULL) {
-			std::cout << "Fail creating SSL context. Exact error:\n";//TODO error logging
-			ERR_print_errors_fp(stderr);
-			exit(EXIT_FAILURE);
-		}
-
-		if (_wchdir(L"E:\\repos\\UrlSL\\UrlSL\\x64\\Debug\\") != 0) {
-			std::cout << "_wchdir failed. Could not change the cwd\n";
-			exit(EXIT_FAILURE);
-		}
-		if (!SSL_CTX_use_certificate_file(ctx, "localhost.crt", SSL_FILETYPE_PEM) ||
-			!SSL_CTX_use_PrivateKey_file(ctx, "localhost.key", SSL_FILETYPE_PEM) ||
-			!SSL_CTX_check_private_key(ctx)) {
-			std::cout << "Failed to open certificates or load them. Exact error: \n";
-			ERR_print_errors_fp(stderr);
-			exit(EXIT_FAILURE);
-		}
-
 		WSADATA wsaData;
 		if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
 			std::cout << "WSAStartup failed\n" << WSAGetLastError();	//TODO Use log func
@@ -231,17 +296,22 @@ private:
 			exit(EXIT_FAILURE);
 		}
 
+		int i = 0;
 		SSL* ssl = NULL;
 		SOCKET clientSocket;
 		while (!self->_shouldStop) {
-			ssl = SSL_new(ctx);
 			if ((clientSocket = WSAAccept(listenSocket, NULL, NULL, NULL, NULL)) == INVALID_SOCKET) {	//TODO implement callback func
 				log("Could not accept client\n", WSAGetLastError());
 				continue;
 			}
-			SSL_set_fd(ssl, clientSocket);	//TODO vrv
-			SSL_accept(ssl);
-			self->_wm.AddWork(clientSocket, ssl);
+			self->_wm.AddAccept(clientSocket);
+			//log("", i);
+			if (++i == MAX_CONNECTION_COUNT) {
+				log("1000", i);
+				log("wait", wait);
+				wait = 0;
+				i = 0;
+			}
 		}
 	}
 
@@ -251,7 +321,7 @@ public:
 
 		int handlerThreadCount = (std::thread::hardware_concurrency() - 1) * 2;	// TODO Needs to be a bit more advanced and generous
 		if (handlerThreadCount <= 0) handlerThreadCount = 1;
-		handlerThreadCount = 6;
+		handlerThreadCount = 1;
 		for (int i = 0; i < handlerThreadCount; i++) { _threads.push_back((HANDLE)_beginthread(Server::clientHandler, 0, (void*)this)); }
 	}
 
